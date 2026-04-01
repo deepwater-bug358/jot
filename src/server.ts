@@ -1,0 +1,1148 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+
+import express, { type NextFunction, type Request, type Response } from "express";
+import hljs from "highlight.js";
+import { marked, type Tokens } from "marked";
+import sanitizeHtml from "sanitize-html";
+
+
+type CommentAnchor = {
+  quote: string;
+  prefix: string;
+  suffix: string;
+  start: number;
+  end: number;
+};
+
+type CommentMessage = {
+  id: string;
+  parentId: string | null;
+  authorId: string;
+  authorName: string;
+  body: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type CommentThread = {
+  id: string;
+  resolved: boolean;
+  createdAt: string;
+  updatedAt: string;
+  anchor: CommentAnchor;
+  messages: CommentMessage[];
+};
+
+type NoteMetaFile = {
+  id: string;
+  title: string;
+  shareId: string;
+  createdAt: string;
+  updatedAt: string;
+  threads: CommentThread[];
+};
+
+type NoteRecord = NoteMetaFile & {
+  markdown: string;
+};
+
+type NoteSummary = {
+  id: string;
+  title: string;
+  updatedAt: string;
+  shareId: string;
+  snippet: string;
+};
+
+type DeviceToken = {
+  id: string;
+  salt: string;
+  hash: string;
+  createdAt: string;
+  lastUsedAt: string;
+};
+
+type AuthData = {
+  passwordSalt: string;
+  passwordHash: string;
+  tokens: DeviceToken[];
+};
+
+type ViewerInfo = {
+  isOwner: boolean;
+  commenterName: string | null;
+  hasCommenterIdentity: boolean;
+};
+
+const portArg = process.argv.find((arg) => arg.startsWith("--port="));
+const port = Number(portArg ? portArg.split("=")[1] : process.env.PORT || 3210);
+const dataDir = process.env.DATA_DIR || path.join(process.cwd(), "data");
+const notesDir = path.join(dataDir, "notes");
+const authFilePath = path.join(dataDir, "auth.json");
+const publicDir = path.join(process.cwd(), "public");
+const ownerSessionCookieName = "md_owner_session";
+const ownerLocalStorageTokenKey = "md_owner_token";
+const commenterIdCookieName = "md_commenter_id";
+const commenterNameCookieName = "md_commenter_name";
+const ownerCookieMaxAgeSeconds = 60 * 60 * 24 * 30;
+const commenterCookieMaxAgeSeconds = 60 * 60 * 24 * 365;
+const notes = new Map<string, NoteRecord>();
+
+const codeRenderer = new marked.Renderer();
+codeRenderer.code = ({ text, lang }: Tokens.Code) => {
+  const language = (lang || "").trim().split(/\s+/)[0];
+  const validLanguage = language && hljs.getLanguage(language) ? language : null;
+  const highlighted = validLanguage
+    ? hljs.highlight(text, { language: validLanguage }).value
+    : escapeHtml(text);
+  const languageClass = validLanguage ? ` class="hljs language-${escapeHtml(validLanguage)}"` : ' class="hljs"';
+  return `<pre><code${languageClass}>${highlighted}</code></pre>`;
+};
+
+marked.setOptions({
+  gfm: true,
+  breaks: true,
+  renderer: codeRenderer,
+});
+
+ensureDirectories();
+loadNotesIntoMemory();
+
+const app = express();
+app.set("trust proxy", true);
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
+app.use("/static", express.static(publicDir));
+
+app.get("/health", (_req, res) => {
+  res.type("text/plain").send("ok");
+});
+
+app.get("/login", (req, res) => {
+  if (isOwnerAuthenticated(req)) {
+    res.redirect("/");
+    return;
+  }
+
+  res.send(renderAuthPage(authConfigured() ? "login" : "setup"));
+});
+
+app.get("/", requireOwnerPage, (_req, res) => {
+  res.send(renderAppShell("list", "Notes"));
+});
+
+app.get("/notes/:id", requireOwnerPage, (req, res) => {
+  const note = notes.get(String(req.params.id));
+  if (!note) {
+    res.status(404).send(renderSimplePage("Not found", `<p>Note not found.</p><p><a href="/">Back</a></p>`));
+    return;
+  }
+
+  res.send(renderAppShell("editor", note.title, { noteId: note.id }));
+});
+
+app.get("/s/:shareId", (req, res) => {
+  const note = findNoteByShareId(String(req.params.shareId));
+  if (!note) {
+    res.status(404).send(renderSimplePage("Not found", `<p>Shared note not found.</p>`));
+    return;
+  }
+
+  res.send(renderAppShell("public", note.title, { shareId: note.shareId }));
+});
+
+app.get("/api/viewer", (req, res) => {
+  res.json({
+    ok: true,
+    authConfigured: authConfigured(),
+    ownerAuthenticated: isOwnerAuthenticated(req),
+    ownerLocalStorageTokenKey,
+    viewer: buildViewerInfo(req),
+  });
+});
+
+app.post("/api/auth/setup", (req, res) => {
+  if (authConfigured()) {
+    res.status(400).json({ ok: false, error: "Password already configured." });
+    return;
+  }
+
+  const password = String(req.body.password || "");
+  const confirmPassword = String(req.body.confirmPassword || "");
+
+  if (password.length < 8) {
+    res.status(400).json({ ok: false, error: "Use at least 8 characters." });
+    return;
+  }
+
+  if (password !== confirmPassword) {
+    res.status(400).json({ ok: false, error: "Passwords do not match." });
+    return;
+  }
+
+  const token = initializeOwnerAuth(password);
+  res.json({ ok: true, token, ownerLocalStorageTokenKey });
+});
+
+app.post("/api/auth/login", (req, res) => {
+  if (!authConfigured()) {
+    res.status(400).json({ ok: false, error: "Password is not configured yet." });
+    return;
+  }
+
+  const password = String(req.body.password || "");
+  if (!passwordMatches(password)) {
+    res.status(401).json({ ok: false, error: "Wrong password." });
+    return;
+  }
+
+  const token = issueOwnerToken();
+  res.json({ ok: true, token, ownerLocalStorageTokenKey });
+});
+
+app.post("/api/auth/token", (req, res) => {
+  const token = String(req.body.token || "");
+  if (!token || !verifyOwnerToken(token)) {
+    clearOwnerSessionCookie(req, res);
+    res.status(401).json({ ok: false });
+    return;
+  }
+
+  setOwnerSessionCookie(req, res, token);
+  res.json({ ok: true });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const token = getOwnerSessionToken(req);
+  if (token) {
+    revokeOwnerToken(token);
+  }
+
+  clearOwnerSessionCookie(req, res);
+  res.json({ ok: true });
+});
+
+app.get("/api/notes", requireOwnerApi, (req, res) => {
+  const query = String(req.query.q || "");
+  const results = searchNotes(query);
+  res.json({ ok: true, notes: results });
+});
+
+app.post("/api/notes", requireOwnerApi, (_req, res) => {
+  const note = createNote();
+  res.json({ ok: true, note: summarizeNote(note, "") });
+});
+
+app.get("/api/notes/:id", requireOwnerApi, (req, res) => {
+  const note = notes.get(String(req.params.id));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Note not found." });
+    return;
+  }
+
+  res.json({ ok: true, ...serializeNoteForClient(note, req) });
+});
+
+app.put("/api/notes/:id", requireOwnerApi, (req, res) => {
+  const note = notes.get(String(req.params.id));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Note not found." });
+    return;
+  }
+
+  note.title = normalizeTitle(String(req.body.title || note.title));
+  note.markdown = String(req.body.markdown || "");
+  note.updatedAt = nowIso();
+  persistNote(note);
+  res.json({ ok: true, savedAt: note.updatedAt });
+});
+
+app.post("/api/render", requireOwnerApi, (req, res) => {
+  const markdown = String(req.body.markdown || "");
+  res.json({ ok: true, html: renderMarkdown(markdown) });
+});
+
+app.get("/api/share/:shareId", (req, res) => {
+  const note = findNoteByShareId(String(req.params.shareId));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Shared note not found." });
+    return;
+  }
+
+  res.json({ ok: true, ...serializeNoteForClient(note, req) });
+});
+
+app.post("/api/share/:shareId/identity", (req, res) => {
+  const note = findNoteByShareId(String(req.params.shareId));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Shared note not found." });
+    return;
+  }
+
+  const name = normalizeCommenterName(String(req.body.name || ""));
+  if (!name) {
+    res.status(400).json({ ok: false, error: "Name is required." });
+    return;
+  }
+
+  const commenterId = getOrCreateCommenterId(req, res);
+  setCommenterNameCookie(req, res, name);
+  res.json({
+    ok: true,
+    commenterIdSet: Boolean(commenterId),
+    viewer: buildViewerInfo(req, { commenterNameOverride: name, hasCommenterIdentityOverride: true }),
+  });
+});
+
+app.post("/api/share/:shareId/threads", (req, res) => {
+  const note = findNoteByShareId(String(req.params.shareId));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Shared note not found." });
+    return;
+  }
+
+  const identity = ensureCommentAuthor(req, res);
+  if (!identity) {
+    res.status(400).json({ ok: false, error: "Set your name first." });
+    return;
+  }
+
+  const anchor = sanitizeAnchor(req.body.anchor);
+  const body = normalizeCommentBody(String(req.body.body || ""));
+  if (!anchor || !body) {
+    res.status(400).json({ ok: false, error: "Anchor and comment body are required." });
+    return;
+  }
+
+  const thread: CommentThread = {
+    id: createId(10),
+    resolved: false,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    anchor,
+    messages: [
+      {
+        id: createId(10),
+        parentId: null,
+        authorId: identity.authorId,
+        authorName: identity.authorName,
+        body,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      },
+    ],
+  };
+
+  note.threads.push(thread);
+  note.updatedAt = nowIso();
+  persistNote(note);
+  res.json({ ok: true, threads: serializeThreads(note, req) });
+});
+
+app.post("/api/share/:shareId/threads/:threadId/replies", (req, res) => {
+  const note = findNoteByShareId(String(req.params.shareId));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Shared note not found." });
+    return;
+  }
+
+  const thread = note.threads.find((item) => item.id === String(req.params.threadId));
+  if (!thread) {
+    res.status(404).json({ ok: false, error: "Thread not found." });
+    return;
+  }
+
+  const identity = ensureCommentAuthor(req, res);
+  if (!identity) {
+    res.status(400).json({ ok: false, error: "Set your name first." });
+    return;
+  }
+
+  const body = normalizeCommentBody(String(req.body.body || ""));
+  if (!body) {
+    res.status(400).json({ ok: false, error: "Reply body is required." });
+    return;
+  }
+
+  const requestedParentId = typeof req.body.parentMessageId === "string" ? String(req.body.parentMessageId) : "";
+  const parentMessageId = requestedParentId || thread.messages[0]?.id || "";
+  if (!parentMessageId || !thread.messages.some((message) => message.id === parentMessageId)) {
+    res.status(400).json({ ok: false, error: "Parent message not found." });
+    return;
+  }
+
+  const timestamp = nowIso();
+  thread.messages.push({
+    id: createId(10),
+    parentId: parentMessageId,
+    authorId: identity.authorId,
+    authorName: identity.authorName,
+    body,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  thread.updatedAt = timestamp;
+  note.updatedAt = timestamp;
+  persistNote(note);
+  res.json({ ok: true, threads: serializeThreads(note, req) });
+});
+
+app.patch("/api/share/:shareId/threads/:threadId", (req, res) => {
+  const note = findNoteByShareId(String(req.params.shareId));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Shared note not found." });
+    return;
+  }
+
+  const thread = note.threads.find((item) => item.id === String(req.params.threadId));
+  if (!thread) {
+    res.status(404).json({ ok: false, error: "Thread not found." });
+    return;
+  }
+
+  if (!canManageThread(req, thread)) {
+    res.status(403).json({ ok: false, error: "Not allowed." });
+    return;
+  }
+
+  thread.resolved = Boolean(req.body.resolved);
+  thread.updatedAt = nowIso();
+  note.updatedAt = thread.updatedAt;
+  persistNote(note);
+  res.json({ ok: true, threads: serializeThreads(note, req) });
+});
+
+app.delete("/api/share/:shareId/threads/:threadId", (req, res) => {
+  const note = findNoteByShareId(String(req.params.shareId));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Shared note not found." });
+    return;
+  }
+
+  const thread = note.threads.find((item) => item.id === String(req.params.threadId));
+  if (!thread) {
+    res.status(404).json({ ok: false, error: "Thread not found." });
+    return;
+  }
+
+  if (!isOwnerAuthenticated(req)) {
+    res.status(403).json({ ok: false, error: "Only the owner can delete a whole thread." });
+    return;
+  }
+
+  note.threads = note.threads.filter((item) => item.id !== thread.id);
+  note.updatedAt = nowIso();
+  persistNote(note);
+  res.json({ ok: true, threads: serializeThreads(note, req) });
+});
+
+app.patch("/api/share/:shareId/messages/:messageId", (req, res) => {
+  const note = findNoteByShareId(String(req.params.shareId));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Shared note not found." });
+    return;
+  }
+
+  const located = locateMessage(note, String(req.params.messageId));
+  if (!located) {
+    res.status(404).json({ ok: false, error: "Message not found." });
+    return;
+  }
+
+  if (!canManageMessage(req, located.message)) {
+    res.status(403).json({ ok: false, error: "Not allowed." });
+    return;
+  }
+
+  const body = normalizeCommentBody(String(req.body.body || ""));
+  if (!body) {
+    res.status(400).json({ ok: false, error: "Body is required." });
+    return;
+  }
+
+  located.message.body = body;
+  located.message.updatedAt = nowIso();
+  located.thread.updatedAt = located.message.updatedAt;
+  note.updatedAt = located.message.updatedAt;
+  persistNote(note);
+  res.json({ ok: true, threads: serializeThreads(note, req) });
+});
+
+app.delete("/api/share/:shareId/messages/:messageId", (req, res) => {
+  const note = findNoteByShareId(String(req.params.shareId));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Shared note not found." });
+    return;
+  }
+
+  const located = locateMessage(note, String(req.params.messageId));
+  if (!located) {
+    res.status(404).json({ ok: false, error: "Message not found." });
+    return;
+  }
+
+  if (!canManageMessage(req, located.message)) {
+    res.status(403).json({ ok: false, error: "Not allowed." });
+    return;
+  }
+
+  located.thread.messages = located.thread.messages.filter((message) => message.id !== located.message.id);
+  if (located.thread.messages.length === 0) {
+    note.threads = note.threads.filter((thread) => thread.id !== located.thread.id);
+  } else {
+    located.thread.updatedAt = nowIso();
+  }
+
+  note.updatedAt = nowIso();
+  persistNote(note);
+  res.json({ ok: true, threads: serializeThreads(note, req) });
+});
+
+app.use((_req, res) => {
+  res.status(404).send(renderSimplePage("Not found", `<p>Page not found.</p>`));
+});
+
+app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  console.error(error);
+  res.status(500).json({ ok: false, error: "Internal server error." });
+});
+
+app.listen(port, () => {
+  console.log(`minimal-md-comments listening on http://localhost:${port}`);
+});
+
+function ensureDirectories() {
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(notesDir, { recursive: true });
+}
+
+function loadNotesIntoMemory() {
+  notes.clear();
+  const files = fs.readdirSync(notesDir).filter((file) => file.endsWith(".md"));
+
+  for (const file of files) {
+    const id = path.basename(file, ".md");
+    const markdownPath = noteMarkdownPath(id);
+    const metaPath = noteMetaPath(id);
+    if (!fs.existsSync(metaPath)) {
+      continue;
+    }
+
+    const markdown = fs.readFileSync(markdownPath, "utf8");
+    const meta = readJson<NoteMetaFile | null>(metaPath, null);
+    if (!meta) {
+      continue;
+    }
+
+    notes.set(id, {
+      ...meta,
+      markdown,
+      threads: Array.isArray(meta.threads)
+        ? meta.threads.map((thread) => ({
+            ...thread,
+            messages: Array.isArray(thread.messages)
+              ? thread.messages.map((message) => ({
+                  ...message,
+                  parentId: typeof message.parentId === "string" ? message.parentId : null,
+                }))
+              : [],
+          }))
+        : [],
+    });
+  }
+}
+
+function noteMarkdownPath(id: string) {
+  return path.join(notesDir, `${id}.md`);
+}
+
+function noteMetaPath(id: string) {
+  return path.join(notesDir, `${id}.json`);
+}
+
+function readJson<T>(filePath: string, fallback: T) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8")) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(filePath: string, value: unknown) {
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function createNote() {
+  const timestamp = nowIso();
+  const id = createShortId();
+  const note: NoteRecord = {
+    id,
+    title: "untitled",
+    shareId: createShortId(14),
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    markdown: "",
+    threads: [],
+  };
+
+  notes.set(id, note);
+  persistNote(note);
+  return note;
+}
+
+function persistNote(note: NoteRecord) {
+  const meta: NoteMetaFile = {
+    id: note.id,
+    title: note.title,
+    shareId: note.shareId,
+    createdAt: note.createdAt,
+    updatedAt: note.updatedAt,
+    threads: note.threads,
+  };
+
+  fs.writeFileSync(noteMarkdownPath(note.id), note.markdown, "utf8");
+  writeJson(noteMetaPath(note.id), meta);
+}
+
+function searchNotes(query: string) {
+  const needle = query.trim().toLowerCase();
+  return Array.from(notes.values())
+    .map((note) => summarizeNote(note, needle))
+    .filter((note) => {
+      if (!needle) {
+        return true;
+      }
+
+      return note.title.toLowerCase().includes(needle) || note.snippet.toLowerCase().includes(needle);
+    })
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+function summarizeNote(note: NoteRecord, needle: string): NoteSummary {
+  return {
+    id: note.id,
+    title: note.title,
+    updatedAt: note.updatedAt,
+    shareId: note.shareId,
+    snippet: buildSnippet(note, needle),
+  };
+}
+
+function buildSnippet(note: NoteRecord, needle: string) {
+  const source = note.markdown.replace(/\s+/g, " ").trim();
+  if (!source) {
+    return "";
+  }
+
+  if (!needle) {
+    return source.slice(0, 140);
+  }
+
+  const index = source.toLowerCase().indexOf(needle);
+  if (index === -1) {
+    return source.slice(0, 140);
+  }
+
+  const start = Math.max(0, index - 40);
+  const end = Math.min(source.length, index + needle.length + 80);
+  return source.slice(start, end);
+}
+
+function findNoteByShareId(shareId: string) {
+  for (const note of notes.values()) {
+    if (note.shareId === shareId) {
+      return note;
+    }
+  }
+
+  return null;
+}
+
+function locateMessage(note: NoteRecord, messageId: string) {
+  for (const thread of note.threads) {
+    const message = thread.messages.find((item) => item.id === messageId);
+    if (message) {
+      return { thread, message };
+    }
+  }
+
+  return null;
+}
+
+function buildViewerInfo(
+  req: Request,
+  overrides?: { commenterNameOverride?: string; hasCommenterIdentityOverride?: boolean },
+): ViewerInfo {
+  const commenter = getCommenterIdentity(req);
+  return {
+    isOwner: isOwnerAuthenticated(req),
+    commenterName: overrides?.commenterNameOverride ?? commenter.name,
+    hasCommenterIdentity: overrides?.hasCommenterIdentityOverride ?? Boolean(commenter.id),
+  };
+}
+
+function serializeThreads(note: NoteRecord, req: Request) {
+  const viewer = buildViewerInfo(req);
+  const commenter = getCommenterIdentity(req);
+
+  return [...note.threads]
+    .sort((a, b) => {
+      const startDelta = a.anchor.start - b.anchor.start;
+      if (startDelta !== 0) {
+        return startDelta;
+      }
+      return a.createdAt.localeCompare(b.createdAt);
+    })
+    .map((thread) => ({
+    id: thread.id,
+    resolved: thread.resolved,
+    createdAt: thread.createdAt,
+    updatedAt: thread.updatedAt,
+    anchor: thread.anchor,
+    canReply: viewer.isOwner || viewer.hasCommenterIdentity,
+    canResolve: viewer.isOwner || viewer.hasCommenterIdentity,
+    canDeleteThread: viewer.isOwner,
+    messages: [...thread.messages]
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .map((message) => ({
+      id: message.id,
+      parentId: message.parentId,
+      authorName: message.authorName,
+      body: message.body,
+      createdAt: message.createdAt,
+      updatedAt: message.updatedAt,
+      canEdit: viewer.isOwner || (Boolean(commenter.id) && commenter.id === message.authorId),
+      canDelete: viewer.isOwner || (Boolean(commenter.id) && commenter.id === message.authorId),
+    })),
+  }));
+}
+
+function serializeNoteForClient(note: NoteRecord, req: Request) {
+  return {
+    note: {
+      id: note.id,
+      title: note.title,
+      markdown: note.markdown,
+      renderedHtml: renderMarkdown(note.markdown),
+      shareId: note.shareId,
+      shareUrl: makeShareUrl(req, note.shareId),
+      updatedAt: note.updatedAt,
+      createdAt: note.createdAt,
+    },
+    viewer: buildViewerInfo(req),
+    threads: serializeThreads(note, req),
+  };
+}
+
+function requireOwnerPage(req: Request, res: Response, next: NextFunction) {
+  if (!isOwnerAuthenticated(req)) {
+    res.redirect("/login");
+    return;
+  }
+
+  next();
+}
+
+function requireOwnerApi(req: Request, res: Response, next: NextFunction) {
+  if (!isOwnerAuthenticated(req)) {
+    res.status(401).json({ ok: false, error: "Unauthorized." });
+    return;
+  }
+
+  next();
+}
+
+function normalizeTitle(input: string) {
+  return input.trim().slice(0, 160) || "untitled";
+}
+
+function normalizeCommentBody(input: string) {
+  return input.trim().slice(0, 4000);
+}
+
+function normalizeCommenterName(input: string) {
+  return input.trim().slice(0, 80);
+}
+
+function sanitizeAnchor(input: unknown) {
+  if (!input || typeof input !== "object") {
+    return null;
+  }
+
+  const source = input as Record<string, unknown>;
+  const quote = String(source.quote || "").slice(0, 1000);
+  const prefix = String(source.prefix || "").slice(0, 200);
+  const suffix = String(source.suffix || "").slice(0, 200);
+  const start = Number(source.start);
+  const end = Number(source.end);
+
+  if (!quote || !Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start) {
+    return null;
+  }
+
+  return { quote, prefix, suffix, start, end } satisfies CommentAnchor;
+}
+
+function renderMarkdown(markdown: string) {
+  const rawHtml = marked.parse(markdown) as string;
+  return sanitizeHtml(rawHtml, {
+    allowedTags: sanitizeHtml.defaults.allowedTags.concat([
+      "img",
+      "h1",
+      "h2",
+      "h3",
+      "h4",
+      "h5",
+      "h6",
+      "pre",
+      "code",
+      "table",
+      "thead",
+      "tbody",
+      "tr",
+      "th",
+      "td",
+      "blockquote",
+      "span",
+    ]),
+    allowedAttributes: {
+      a: ["href", "name", "target", "rel"],
+      img: ["src", "alt", "title"],
+      code: ["class"],
+      span: ["class"],
+    },
+    allowedClasses: {
+      code: ["hljs", /^language-/],
+      span: [/^hljs.*/],
+    },
+    allowedSchemes: ["http", "https", "mailto"],
+    transformTags: {
+      a: sanitizeHtml.simpleTransform("a", { rel: "noopener noreferrer", target: "_blank" }),
+    },
+  });
+}
+
+function makeShareUrl(req: Request, shareId: string) {
+  return `${req.protocol}://${req.get("host")}/s/${shareId}`;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function createShortId(length = 8) {
+  return crypto.randomBytes(length).toString("base64url").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, length);
+}
+
+function createId(length = 12) {
+  return createShortId(length);
+}
+
+function escapeHtml(input: string) {
+  return input
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function hashSecret(value: string, salt: string) {
+  return crypto.scryptSync(value, salt, 64).toString("hex");
+}
+
+function secureEqualsHex(a: string, b: string) {
+  const left = Buffer.from(a, "hex");
+  const right = Buffer.from(b, "hex");
+  if (left.length !== right.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(left, right);
+}
+
+function loadAuthData() {
+  return readJson<AuthData | null>(authFilePath, null);
+}
+
+function saveAuthData(authData: AuthData) {
+  writeJson(authFilePath, authData);
+}
+
+function authConfigured() {
+  const auth = loadAuthData();
+  return Boolean(auth?.passwordSalt && auth?.passwordHash);
+}
+
+function passwordMatches(password: string) {
+  const auth = loadAuthData();
+  if (!auth) {
+    return false;
+  }
+
+  return secureEqualsHex(hashSecret(password, auth.passwordSalt), auth.passwordHash);
+}
+
+function initializeOwnerAuth(password: string) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const auth: AuthData = {
+    passwordSalt: salt,
+    passwordHash: hashSecret(password, salt),
+    tokens: [],
+  };
+  saveAuthData(auth);
+  return issueOwnerToken();
+}
+
+function issueOwnerToken() {
+  const auth = loadAuthData();
+  if (!auth) {
+    throw new Error("Password not configured.");
+  }
+
+  const token = crypto.randomBytes(32).toString("base64url");
+  const salt = crypto.randomBytes(16).toString("hex");
+  const timestamp = nowIso();
+  auth.tokens.push({
+    id: createId(10),
+    salt,
+    hash: hashSecret(token, salt),
+    createdAt: timestamp,
+    lastUsedAt: timestamp,
+  });
+  saveAuthData(auth);
+  return token;
+}
+
+function verifyOwnerToken(token: string) {
+  const auth = loadAuthData();
+  if (!auth) {
+    return false;
+  }
+
+  let changed = false;
+  for (const stored of auth.tokens) {
+    if (secureEqualsHex(hashSecret(token, stored.salt), stored.hash)) {
+      const lastSeen = Date.parse(stored.lastUsedAt);
+      if (Number.isNaN(lastSeen) || Date.now() - lastSeen > 1000 * 60 * 60 * 12) {
+        stored.lastUsedAt = nowIso();
+        changed = true;
+      }
+      if (changed) {
+        saveAuthData(auth);
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function revokeOwnerToken(token: string) {
+  const auth = loadAuthData();
+  if (!auth) {
+    return;
+  }
+
+  const tokens = auth.tokens.filter((stored) => !secureEqualsHex(hashSecret(token, stored.salt), stored.hash));
+  if (tokens.length !== auth.tokens.length) {
+    auth.tokens = tokens;
+    saveAuthData(auth);
+  }
+}
+
+function parseCookies(header: string | undefined) {
+  const cookies: Record<string, string> = {};
+  if (!header) {
+    return cookies;
+  }
+
+  for (const item of header.split(";")) {
+    const index = item.indexOf("=");
+    if (index === -1) {
+      continue;
+    }
+    const key = item.slice(0, index).trim();
+    const value = item.slice(index + 1).trim();
+    cookies[key] = decodeURIComponent(value);
+  }
+
+  return cookies;
+}
+
+function setCookie(
+  req: Request,
+  res: Response,
+  name: string,
+  value: string,
+  options: { maxAgeSeconds: number; httpOnly?: boolean },
+) {
+  const secure = req.secure ? "; Secure" : "";
+  const httpOnly = options.httpOnly === false ? "" : "; HttpOnly";
+  res.append(
+    "Set-Cookie",
+    `${name}=${encodeURIComponent(value)}; Path=/; SameSite=Lax; Max-Age=${options.maxAgeSeconds}${httpOnly}${secure}`,
+  );
+}
+
+function clearCookie(req: Request, res: Response, name: string, httpOnly = true) {
+  const secure = req.secure ? "; Secure" : "";
+  const httpOnlyPart = httpOnly ? "; HttpOnly" : "";
+  res.append("Set-Cookie", `${name}=; Path=/; SameSite=Lax; Max-Age=0${httpOnlyPart}${secure}`);
+}
+
+function getOwnerSessionToken(req: Request) {
+  return parseCookies(req.headers.cookie)[ownerSessionCookieName] || null;
+}
+
+function setOwnerSessionCookie(req: Request, res: Response, token: string) {
+  setCookie(req, res, ownerSessionCookieName, token, { maxAgeSeconds: ownerCookieMaxAgeSeconds });
+}
+
+function clearOwnerSessionCookie(req: Request, res: Response) {
+  clearCookie(req, res, ownerSessionCookieName);
+}
+
+function isOwnerAuthenticated(req: Request) {
+  const token = getOwnerSessionToken(req);
+  return Boolean(token && verifyOwnerToken(token));
+}
+
+function getCommenterIdentity(req: Request) {
+  const cookies = parseCookies(req.headers.cookie);
+  return {
+    id: cookies[commenterIdCookieName] || null,
+    name: cookies[commenterNameCookieName] || null,
+  };
+}
+
+function getOrCreateCommenterId(req: Request, res: Response) {
+  const existing = getCommenterIdentity(req).id;
+  if (existing) {
+    return existing;
+  }
+
+  const created = crypto.randomBytes(24).toString("base64url");
+  setCookie(req, res, commenterIdCookieName, created, { maxAgeSeconds: commenterCookieMaxAgeSeconds });
+  return created;
+}
+
+function setCommenterNameCookie(req: Request, res: Response, name: string) {
+  setCookie(req, res, commenterNameCookieName, name, { maxAgeSeconds: commenterCookieMaxAgeSeconds });
+}
+
+function ensureCommentAuthor(req: Request, res: Response) {
+  if (isOwnerAuthenticated(req)) {
+    return { authorId: "__owner__", authorName: "Owner" };
+  }
+
+  const commenter = getCommenterIdentity(req);
+  if (!commenter.name) {
+    return null;
+  }
+
+  const commenterId = commenter.id || getOrCreateCommenterId(req, res);
+  return { authorId: commenterId, authorName: commenter.name };
+}
+
+function canManageMessage(req: Request, message: CommentMessage) {
+  if (isOwnerAuthenticated(req)) {
+    return true;
+  }
+
+  const commenter = getCommenterIdentity(req);
+  return Boolean(commenter.id && commenter.id === message.authorId);
+}
+
+function canManageThread(req: Request, thread: CommentThread) {
+  if (isOwnerAuthenticated(req)) {
+    return true;
+  }
+
+  const commenter = getCommenterIdentity(req);
+  return Boolean(commenter.id && thread.messages.some((message) => message.authorId === commenter.id));
+}
+
+function renderSimplePage(title: string, body: string) {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(title)}</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="page-shell simple-page">
+    <main class="simple-page-content">${body}</main>
+  </body>
+</html>`;
+}
+
+function renderAuthPage(mode: "login" | "setup") {
+  const title = mode === "setup" ? "Set password" : "Sign in";
+  const heading = mode === "setup" ? "Set the password" : "Enter the password";
+  const hint =
+    mode === "setup"
+      ? "First startup. This becomes the single owner password for the instance."
+      : "This instance uses one password and per-device tokens.";
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${title}</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="page-shell auth-shell" data-auth-mode="${mode}">
+    <main class="auth-layout">
+      <h1>${heading}</h1>
+      <p class="auth-hint">${hint}</p>
+      <p class="auth-error hidden" id="auth-error"></p>
+      <form id="auth-form" class="auth-form">
+        <input id="password" name="password" type="password" autocomplete="${mode === "setup" ? "new-password" : "current-password"}" placeholder="Password" minlength="8" required autofocus />
+        ${
+          mode === "setup"
+            ? '<input id="confirmPassword" name="confirmPassword" type="password" autocomplete="new-password" placeholder="Confirm password" minlength="8" required />'
+            : ""
+        }
+        <div class="auth-actions">
+          <button type="submit">${mode === "setup" ? "Save password" : "Sign in"}</button>
+        </div>
+      </form>
+    </main>
+    <script>window.__OWNER_TOKEN_KEY__ = ${JSON.stringify(ownerLocalStorageTokenKey)};</script>
+    <script src="/static/login.js" defer></script>
+  </body>
+</html>`;
+}
+
+function renderAppShell(
+  page: "list" | "editor" | "public",
+  title: string,
+  data?: { noteId?: string; shareId?: string },
+) {
+  const attrs = [
+    `data-page="${page}"`,
+    data?.noteId ? `data-note-id="${escapeHtml(data.noteId)}"` : "",
+    data?.shareId ? `data-share-id="${escapeHtml(data.shareId)}"` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(title)}</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="page-shell app-page" ${attrs}>
+    <div id="app"></div>
+    <script>window.__OWNER_TOKEN_KEY__ = ${JSON.stringify(ownerLocalStorageTokenKey)};</script>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>`;
+}
