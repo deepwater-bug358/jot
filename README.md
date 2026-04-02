@@ -77,7 +77,7 @@ npx @mariozechner/jot myserver delete <note-id>
 
 ### Shared mode
 
-Anyone with a share link can use it to register. No API key needed. The link itself is the credential, and access depends on what the owner configured (view, comment, or edit). This works for both humans and their agents.
+Anyone with a share link can use it to register. No API key needed. The link itself is the credential, and access depends on what the owner configured (view, comment, or edit). This works for both humans and their agents. Humans can use the link in the browser for better UX.
 
 ```bash
 npx @mariozechner/jot register shared https://jot.example.com/s/abc123
@@ -107,34 +107,34 @@ The `.md` files are derived from the collaborative editing state stored in the `
 
 All owner endpoints require `Authorization: Bearer <api-key>`.
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/notes` | List notes |
-| POST | `/api/notes` | Create note |
-| GET | `/api/notes/:id` | Read note |
-| PUT | `/api/notes/:id` | Update title, markdown, shareAccess |
-| DELETE | `/api/notes/:id` | Delete note |
-| POST | `/api/notes/:id/edit` | Apply text edits |
-| POST | `/api/notes/:id/threads` | Create comment thread |
-| POST | `/api/notes/:id/threads/:tid/replies` | Reply to thread |
-| PATCH | `/api/notes/:id/threads/:tid` | Resolve/reopen thread |
-| DELETE | `/api/notes/:id/threads/:tid` | Delete thread |
-| PATCH | `/api/notes/:id/messages/:mid` | Edit comment |
-| DELETE | `/api/notes/:id/messages/:mid` | Delete comment |
-| GET | `/api/keys` | List API keys |
-| POST | `/api/keys` | Create API key |
-| DELETE | `/api/keys/:id` | Delete API key |
+| Method | Endpoint                              | Description                         |
+| ------ | ------------------------------------- | ----------------------------------- |
+| GET    | `/api/notes?q=<query>`                 | List/search notes                   |
+| POST   | `/api/notes`                          | Create note                         |
+| GET    | `/api/notes/:id`                      | Read note                           |
+| PUT    | `/api/notes/:id`                      | Update title, markdown, shareAccess |
+| DELETE | `/api/notes/:id`                      | Delete note                         |
+| POST   | `/api/notes/:id/edit`                 | Apply text edits                    |
+| POST   | `/api/notes/:id/threads`              | Create comment thread               |
+| POST   | `/api/notes/:id/threads/:tid/replies` | Reply to thread                     |
+| PATCH  | `/api/notes/:id/threads/:tid`         | Resolve/reopen thread               |
+| DELETE | `/api/notes/:id/threads/:tid`         | Delete thread                       |
+| PATCH  | `/api/notes/:id/messages/:mid`        | Edit comment                        |
+| DELETE | `/api/notes/:id/messages/:mid`        | Delete comment                      |
+| GET    | `/api/keys`                           | List API keys                       |
+| POST   | `/api/keys`                           | Create API key                      |
+| DELETE | `/api/keys/:id`                       | Delete API key                      |
 
 Share endpoints (no auth, access controlled by `shareAccess`):
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/share/:sid` | Read shared note |
-| GET | `/api/share/:sid/note` | Read shared note (lightweight) |
-| POST | `/api/share/:sid/edit` | Edit (requires edit access) |
-| POST | `/api/share/:sid/threads` | Create comment |
-| POST | `/api/share/:sid/threads/:tid/replies` | Reply |
-| POST | `/api/share/:sid/render` | Render markdown to HTML |
+| Method | Endpoint                               | Description                    |
+| ------ | -------------------------------------- | ------------------------------ |
+| GET    | `/api/share/:sid`                      | Read shared note               |
+| GET    | `/api/share/:sid/note`                 | Read shared note (lightweight) |
+| POST   | `/api/share/:sid/edit`                 | Edit (requires edit access)    |
+| POST   | `/api/share/:sid/threads`              | Create comment                 |
+| POST   | `/api/share/:sid/threads/:tid/replies` | Reply                          |
+| POST   | `/api/share/:sid/render`               | Render markdown to HTML        |
 
 ## License
 
