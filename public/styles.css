@@ -99,6 +99,8 @@ html, body {
 }
 
 body { min-height: 100vh; }
+
+[data-page="editor"], [data-page="editor"] .app-root { height: 100vh; overflow: hidden; }
 a { color: inherit; text-decoration: none; }
 button, input, textarea { font: inherit; }
 
@@ -177,7 +179,7 @@ input:focus, textarea:focus { border-color: var(--muted); }
 .auth-actions { padding-top: 0.4rem; }
 .auth-actions button { border-radius: 10px; padding: 0.8rem 1rem; }
 
-.app-root { min-height: 100vh; }
+.app-root { min-height: 100vh; overflow: hidden; }
 
 .topbar {
   min-height: var(--toolbar-height);
@@ -270,6 +272,7 @@ input:focus, textarea:focus { border-color: var(--muted); }
   font-size: 0.88rem; line-height: 1.58;
   font-family: "SFMono-Regular", ui-monospace, Menlo, Monaco, Consolas, monospace;
   word-wrap: break-word; overflow-wrap: break-word; white-space: pre-wrap; overflow-x: hidden;
+  overscroll-behavior: contain;
 }
 .editor-textarea:focus { border: 0; }
 
@@ -284,7 +287,7 @@ input:focus, textarea:focus { border-color: var(--muted); }
 }
 .preview-controls .jot-btn { backdrop-filter: blur(6px); }
 
-.preview-scroll { overflow-y: auto; overflow-x: hidden; height: 100%; }
+.preview-scroll { overflow-y: auto; overflow-x: hidden; height: 100%; overscroll-behavior: contain; }
 .preview-canvas { position: relative; min-height: 100%; }
 .preview-content { max-width: 880px; min-height: 100%; margin: 0 auto; padding: 2rem 1.75rem 8rem 2.5rem; }
 .preview-stage.public .preview-content { max-width: 980px; }
